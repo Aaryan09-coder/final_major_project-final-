@@ -27,9 +27,9 @@ COMPLETE DATA FLOW: ML MODEL → CONTROLLER → ESP32 → SERVOS
 
 3. ESP32 COMMUNICATION (ToyController.set_servo):
    Input: toy_id (0), servo_type (0-3), angle (0-180)
-   Process: Packs to 3-byte binary: struct.pack('BBB', toy_id, servo_type, angle)
-   Network: Sends via TCP to ESP32 at 192.168.4.1:8080
-   Response: Waits for "OK" (2 bytes) acknowledgment
+   Process: Converts to JSON format: {"type": "servo", "servo1": angle, ...}
+   Network: Sends via TCP to ESP32 at 192.168.4.1:8000
+   Protocol: JSON format (matches updated ESP32 firmware)
 
 4. ESP32 FIRMWARE (main.cpp):
    Input: 3-byte TCP command (toy_id, servo_type, angle)
@@ -56,7 +56,7 @@ IMPORTANT NOTES:
 
 import sys
 import os
-import struct
+import json
 import socket
 import time
 import cv2
@@ -70,7 +70,7 @@ from ml_model.yolo_fightingpose_detection import ZonePoseDetector
 
 # ESP32 TCP server configuration
 ESP_HOST = "192.168.4.1"
-ESP_PORT = 8080
+ESP_PORT = 8000  # Updated to match JSON protocol firmware
 
 # Default servo angles - TUNE THESE TO MATCH YOUR MECHANICAL GEOMETRY
 neutral_base = 90
@@ -121,25 +121,25 @@ class ToyController:
     
     def set_servo(self, toy_id, servo_type, angle):
         """
-        Send servo command to ESP32
+        Send servo command to ESP32 using JSON protocol
         
-        This function converts the ML model output (via map_pose_to_arm) into
-        the 3-byte binary protocol expected by the ESP32 firmware.
+        This function sends individual servo commands. For multiple servos,
+        use send_servos() method instead.
         
-        Protocol (matches main.cpp):
-        - Byte 0: toy_id (currently 0)
-        - Byte 1: servo_type (0-3: base, shoulder, elbow, claw)
-        - Byte 2: angle (0-180 degrees)
-        
-        ESP32 responds with "OK" (2 bytes) on success.
+        Protocol (matches updated ESP32 firmware):
+        - JSON format: {"type": "servo", "servo1": angle, "servo2": angle, ...}
+        - servo_type 0 → servo1 (Base)
+        - servo_type 1 → servo2 (Shoulder)
+        - servo_type 2 → servo3 (Elbow)
+        - servo_type 3 → servo4 (Claw)
         
         Args:
-            toy_id: Toy identifier (keep as 0 for now)
+            toy_id: Toy identifier (currently unused, keep as 0)
             servo_type: Servo index (0-3: base, shoulder, elbow, claw)
             angle: Angle in degrees (0-180)
             
         Returns:
-            bool: True if command acknowledged, False otherwise
+            bool: True if command sent successfully, False otherwise
         """
         if not self.connected or self.socket is None:
             return False
@@ -152,23 +152,67 @@ class ToyController:
         angle = int(max(0, min(180, angle)))  # Clamp to valid range
         
         try:
-            # Pack command as 3 bytes: toy_id, servo_type, angle
-            # This binary format matches what ESP32 firmware expects in main.cpp
-            command = struct.pack('BBB', toy_id, servo_type, angle)
-            self.socket.sendall(command)
+            # Create JSON command for single servo
+            # Map servo_type (0-3) to servo name (servo1-4)
+            servo_name = f"servo{servo_type + 1}"
+            command = {
+                "type": "servo",
+                servo_name: angle
+            }
             
-            # Wait for "OK" acknowledgment (2 bytes) - matches ESP32 firmware response
-            response = self.socket.recv(2)
-            if response == b"OK":
-                return True
-            else:
-                print(f"ERROR: ESP32 unexpected response: {response} (expected b'OK')")
-                return False
+            # Send JSON command (with newline terminator)
+            message = json.dumps(command) + "\n"
+            self.socket.sendall(message.encode("utf-8"))
+            
+            # Note: ESP32 JSON firmware doesn't send "OK" response
+            # Command is considered successful if sent without error
+            return True
+            
         except socket.timeout:
             print(f"ERROR: ESP32 command timeout (servo={servo_type}, angle={angle})")
             return False
         except Exception as e:
             print(f"ERROR: Failed to send ESP32 command: {e}")
+            self.connected = False
+            return False
+    
+    def send_servos(self, servo1=None, servo2=None, servo3=None, servo4=None):
+        """
+        Send multiple servo angles at once (more efficient)
+        
+        Args:
+            servo1: Base angle (0-180) or None to skip
+            servo2: Shoulder angle (0-180) or None to skip
+            servo3: Elbow angle (0-180) or None to skip
+            servo4: Claw angle (0-180) or None to skip
+            
+        Returns:
+            bool: True if command sent successfully
+        """
+        if not self.connected or self.socket is None:
+            return False
+        
+        try:
+            # Build JSON command with only specified servos
+            command = {"type": "servo"}
+            
+            if servo1 is not None:
+                command["servo1"] = int(max(0, min(180, servo1)))
+            if servo2 is not None:
+                command["servo2"] = int(max(0, min(180, servo2)))
+            if servo3 is not None:
+                command["servo3"] = int(max(0, min(180, servo3)))
+            if servo4 is not None:
+                command["servo4"] = int(max(0, min(180, servo4)))
+            
+            # Send JSON command (with newline terminator)
+            message = json.dumps(command) + "\n"
+            self.socket.sendall(message.encode("utf-8"))
+            
+            return True
+            
+        except Exception as e:
+            print(f"ERROR: Failed to send servo command: {e}")
             self.connected = False
             return False
     
@@ -328,7 +372,7 @@ def main():
     print("ML MODEL → ESP32 CONNECTION ACTIVE")
     print("="*80)
     print("ML Output: motion_state dict with base/forward/vertical/grip")
-    print("ESP32 Commands: 3-byte packets (toy_id, servo_type, angle)")
+    print("ESP32 Commands: JSON format ({\"type\":\"servo\",\"servo1\":angle,...})")
     print("="*80 + "\n")
     
     prev_motion_state = None

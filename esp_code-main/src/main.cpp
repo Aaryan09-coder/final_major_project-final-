@@ -30,13 +30,17 @@
 const int SERVO_PINS[4] = {14, 12, 13, 15};  // Pins for servo 0, 1, 2, 3
 
 // PWM configuration for LEDC
-const int PWM_FREQ = 50;  // 50Hz for standard servos
+const int PWM_FREQ = 50;  // 50Hz for standard servos (SG90)
 const int PWM_RESOLUTION = 16;  // 16-bit resolution
 const int SERVO_CHANNELS[4] = {0, 1, 2, 3};  // LEDC channels for each servo
 
-// Duty cycle limits - TUNE THESE FOR YOUR SERVOS (min=40, max=115 as default)
-const int minDuty = 40;   // Minimum duty cycle (0 degrees)
-const int maxDuty = 115;  // Maximum duty cycle (180 degrees)
+// SG90 servo PWM duty cycle values (16-bit, 50Hz)
+// At 50Hz: period = 20ms
+// 1ms pulse (0°) = 5% duty = 3276
+// 1.5ms pulse (90°) = 7.5% duty = 4915
+// 2ms pulse (180°) = 10% duty = 6553
+const uint32_t SERVO_MIN_DUTY = 3276;  // 1ms pulse for 0 degrees
+const uint32_t SERVO_MAX_DUTY = 6553;  // 2ms pulse for 180 degrees
 
 // WiFi AP configuration
 const char* AP_SSID = "ESP32_AP";
@@ -45,7 +49,7 @@ const char* AP_PASSWORD = "12345678";
 // TCP server configuration - Changed to port 8000 for JSON protocol
 WiFiServer server(8000);
 
-// Function to set servo angle
+// Function to set servo angle for SG90 servos
 void setServoAngle(int channel, int angle) {
   if (channel < 0 || channel >= 4) {
     return;
@@ -54,14 +58,21 @@ void setServoAngle(int channel, int angle) {
   // Clamp angle to 0-180 range
   angle = constrain(angle, 0, 180);
   
-  // Map angle (0-180) to duty cycle (minDuty-maxDuty)
-  int duty = map(angle, 0, 180, minDuty, maxDuty);
-  
-  // Convert to LEDC duty value (0-65535 for 16-bit)
-  uint32_t dutyValue = map(duty, 0, 255, 0, 65535);
+  // Map angle (0-180) directly to 16-bit PWM duty cycle for SG90 servos
+  // SG90 servos: 1ms (0°) to 2ms (180°) pulse width at 50Hz
+  // This gives us the correct PWM values: 3276 (0°) to 6553 (180°)
+  uint32_t dutyValue = map(angle, 0, 180, SERVO_MIN_DUTY, SERVO_MAX_DUTY);
   
   // Set duty cycle
   ledcWrite(SERVO_CHANNELS[channel], dutyValue);
+  
+  // Debug output (can be disabled later by commenting out)
+  Serial.print("Servo");
+  Serial.print(channel);
+  Serial.print(": angle=");
+  Serial.print(angle);
+  Serial.print("°, duty=");
+  Serial.println(dutyValue);
 }
 
 void setup() {
@@ -177,29 +188,47 @@ void loop() {
               int servo1, servo2, servo3, servo4;
               
               if (parseJSONCommand(buffer, servo1, servo2, servo3, servo4)) {
+                // Debug: Show received JSON and parsed values
+                Serial.print("Received JSON: ");
+                Serial.println(buffer);
+                Serial.print("Parsed values - servo1:");
+                Serial.print(servo1);
+                Serial.print(" servo2:");
+                Serial.print(servo2);
+                Serial.print(" servo3:");
+                Serial.print(servo3);
+                Serial.print(" servo4:");
+                Serial.println(servo4);
+                
                 // Update servos with new angles
                 if (servo1 >= 0) {
+                  Serial.print("Setting Servo1 (Base) to ");
+                  Serial.print(servo1);
+                  Serial.println("°");
                   setServoAngle(0, servo1); // Base
-                  Serial.print("Servo1 (Base): ");
-                  Serial.println(servo1);
                 }
                 if (servo2 >= 0) {
+                  Serial.print("Setting Servo2 (Shoulder) to ");
+                  Serial.print(servo2);
+                  Serial.println("°");
                   setServoAngle(1, servo2); // Shoulder
-                  Serial.print("Servo2 (Shoulder): ");
-                  Serial.println(servo2);
                 }
                 if (servo3 >= 0) {
+                  Serial.print("Setting Servo3 (Elbow) to ");
+                  Serial.print(servo3);
+                  Serial.println("°");
                   setServoAngle(2, servo3); // Elbow
-                  Serial.print("Servo3 (Elbow): ");
-                  Serial.println(servo3);
                 }
                 if (servo4 >= 0) {
+                  Serial.print("Setting Servo4 (Claw) to ");
+                  Serial.print(servo4);
+                  Serial.println("°");
                   setServoAngle(3, servo4); // Claw
-                  Serial.print("Servo4 (Claw): ");
-                  Serial.println(servo4);
                 }
               } else {
                 Serial.println("ERROR: Failed to parse JSON command");
+                Serial.print("Buffer was: ");
+                Serial.println(buffer);
               }
             }
             
