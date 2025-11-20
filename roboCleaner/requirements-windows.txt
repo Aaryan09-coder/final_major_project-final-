@@ -42,3 +42,4 @@ ultralytics-thop==2.0.14
 urllib3==2.3.0
 wheel==0.45.1
 mediapipe==0.10.21
+scikit-learn==1.5.2

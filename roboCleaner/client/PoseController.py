@@ -20,6 +20,19 @@ except Exception:
     mp = None
     _HAS_MEDIAPIPE = False
 
+# Import trained grip classifier
+try:
+    import sys
+    import os
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from ml_model.grip_classifier import GripClassifier
+    _HAS_GRIP_CLASSIFIER = True
+except Exception as e:
+    GripClassifier = None
+    _HAS_GRIP_CLASSIFIER = False
+
 
 def show_control_mode_menu():
     """
@@ -50,7 +63,7 @@ def show_control_mode_menu():
     print("              Down (elbow bent) = 0°, Neutral = 90°, Up (arm straight) = 180°")
     print("\n       Key '4' → Claw Open/Close (Servo4)")
     print("              Movement: Open/close your hand")
-    print("              Open hand = 0° (claw opens), Closed fist = 180° (claw closes)")
+    print("              Palm (open hand) = 0° (claw opens), Fist (closed hand) = 180° (claw closes)")
     
     print("\n  [2] TWO-HANDED CONTROL (Advanced)")
     print("  " + "-"*76)
@@ -62,7 +75,7 @@ def show_control_mode_menu():
     print("         • Wrist X position → Base Left/Right (Servo1)")
     print("           Move left arm horizontally: Left = 0°, Right = 180°")
     print("         • Hand open/close → Claw Open/Close (Servo4)")
-    print("           Open left hand = claw opens (0°), Close left hand = claw closes (180°)")
+    print("           Palm (open left hand) = claw opens (0°), Fist (closed left hand) = claw closes (180°)")
     print("\n       RIGHT ARM:")
     print("         • Shoulder angle → Forward/Backward (Servo2)")
     print("           Raise/lower right shoulder: Backward = 0°, Forward = 180°")
@@ -97,6 +110,19 @@ class PoseController:
         self.hands_detector = None
         self.left_hands_detector = None
         self.right_hands_detector = None
+        
+        # Trained grip classifier (if available)
+        self.grip_classifier = None
+        if _HAS_GRIP_CLASSIFIER and GripClassifier is not None:
+            try:
+                self.grip_classifier = GripClassifier()
+                if self.grip_classifier.is_available():
+                    print("✓ Using trained grip classifier for better accuracy")
+                else:
+                    print("⚠ Grip classifier model not available, using fallback method")
+            except Exception as e:
+                print(f"⚠ Failed to initialize grip classifier: {e}")
+                self.grip_classifier = None
         
         if _HAS_MEDIAPIPE:
             try:
@@ -294,17 +320,52 @@ class PoseController:
                     # Our arm_side is from body's perspective
                     if (arm_side == 'left' and hand_side == 'Left') or \
                        (arm_side == 'right' and hand_side == 'Right'):
-                        # Calculate hand openness
-                        tip_idxs = [4, 8, 12, 16, 20]  # Thumb, index, middle, ring, pinky tips
-                        wrist_lm = lm[0]  # Wrist landmark
                         
-                        dists = []
-                        for idx in tip_idxs:
-                            dx = lm[idx].x - wrist_lm.x
-                            dy = lm[idx].y - wrist_lm.y
-                            dists.append((dx * dx + dy * dy) ** 0.5)
+                        avg = None
                         
-                        avg = float(sum(dists) / len(dists))
+                        # Try trained classifier first (more accurate)
+                        if self.grip_classifier is not None and self.grip_classifier.is_available():
+                            try:
+                                prediction = self.grip_classifier.predict(res.multi_hand_landmarks[0])
+                                if prediction:
+                                    # Convert classifier output to openness value
+                                    # Note: This value will be inverted when mapping to servo angle
+                                    # is_closed=True (fist) -> low openness (0.3-0.5) -> will map to high servo angle (claw closes)
+                                    # is_closed=False (palm) -> high openness (0.6-0.9) -> will map to low servo angle (claw opens)
+                                    if prediction['is_closed']:
+                                        # Fist: map confidence to 0.3-0.5 range (will become high servo angle = claw closes)
+                                        avg = 0.3 + (1.0 - prediction['confidence']) * 0.2
+                                    else:
+                                        # Palm: map confidence to 0.6-0.9 range (will become low servo angle = claw opens)
+                                        avg = 0.6 + prediction['confidence'] * 0.3
+                                    
+                                    # Draw classifier info on frame
+                                    if annotated_frame is not None:
+                                        status = "FIST" if prediction['is_closed'] else "PALM"
+                                        conf = prediction['confidence']
+                                        cv2.putText(annotated_frame, 
+                                                   f"Grip: {status} ({conf:.2f})",
+                                                   (x1, y1 - 10), 
+                                                   cv2.FONT_HERSHEY_SIMPLEX, 
+                                                   0.5, (0, 255, 0), 2)
+                            except Exception as e:
+                                # Fallback to distance-based method if classifier fails
+                                pass
+                        
+                        # Fallback: Calculate hand openness using distance method
+                        # Distance method: large distance (fingers spread) = open palm, small distance = closed fist
+                        if avg is None:
+                            tip_idxs = [4, 8, 12, 16, 20]  # Thumb, index, middle, ring, pinky tips
+                            wrist_lm = lm[0]  # Wrist landmark
+                            
+                            dists = []
+                            for idx in tip_idxs:
+                                dx = lm[idx].x - wrist_lm.x
+                                dy = lm[idx].y - wrist_lm.y
+                                dists.append((dx * dx + dy * dy) ** 0.5)
+                            
+                            # avg: large (~0.6-1.0) = open palm, small (~0.3-0.5) = closed fist
+                            avg = float(sum(dists) / len(dists))
                         
                         # Draw hand landmarks on annotated frame if provided
                         if annotated_frame is not None and mp is not None:
@@ -510,9 +571,12 @@ class PoseController:
                             )
                             
                             if hand_openness is not None:
-                                # Map hand openness: open hand (smaller value) → 0°, closed (larger) → 180°
-                                # Range: 0.30 (open) to 1.00 (closed)
-                                servo4_angle = int(np.clip(np.interp(hand_openness, [0.30, 1.00], [0, 180]), 0, 180))
+                                # Map hand openness to servo angle
+                                # Both classifier and distance methods use this mapping:
+                                # - Large value (~0.6-1.0) = open palm → Low angle (0-60°) → Claw OPENS ✓
+                                # - Small value (~0.3-0.5) = closed fist → High angle (120-180°) → Claw CLOSES ✓
+                                # Inverted mapping [180, 0]: high openness → low angle, low openness → high angle
+                                servo4_angle = int(np.clip(np.interp(hand_openness, [0.30, 1.00], [180, 0]), 0, 180))
                                 
                                 # Display hand openness value
                                 cv2.putText(annotated_frame, f"HandOpenness: {hand_openness:.3f}", 
@@ -668,8 +732,10 @@ class PoseController:
                             )
                             
                             if left_hand_openness is not None:
+                                # Map hand openness: Palm → Claw opens (low angle), Fist → Claw closes (high angle)
+                                # Inverted mapping: high openness → low angle, low openness → high angle
                                 servo4_angle = int(np.clip(
-                                    np.interp(left_hand_openness, [0.30, 1.00], [0, 180]), 0, 180
+                                    np.interp(left_hand_openness, [0.30, 1.00], [180, 0]), 0, 180
                                 ))
                             else:
                                 # Keep previous value if detection fails

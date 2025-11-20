@@ -1,0 +1,8 @@
+{
+  "model_type": "random_forest",
+  "feature_count": 24,
+  "training_samples": 54828,
+  "fist_samples": 26892,
+  "palm_samples": 27936,
+  "accuracy": 0.9805573794411615
+}
